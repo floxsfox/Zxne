@@ -1,0 +1,450 @@
+# FileX Studio - ONE-FILE workflow: ZIP -> extract -> build APK
+#
+# Upload THIS file to .github/workflows/filex-build.yml and FileXStudio-Source.zip to the
+# repository root, then run it from the Actions tab. No tokens, no second workflow file needed.
+#
+# - If a ZIP is found it is validated (ZIP Slip, symlinks, CRC, size limits) and extracted
+#   into the runner workspace, then the APK is built from it.
+# - If no ZIP is found but the project is already in the repository, that source is built.
+# - Files under .github/ inside the ZIP are ignored (GITHUB_TOKEN may not write workflows).
+# - Optional input commit_source=true saves the extracted source in the repository and
+#   deletes the ZIP, so the code can be edited in GitHub Web afterwards.
+name: FileX Studio - ZIP to APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      zip_path:
+        description: "ZIP path in the repository (empty = FileXStudio-Source.zip, then input/FileXStudio.zip)"
+        required: false
+        default: ""
+        type: string
+      commit_source:
+        description: "Save the extracted source in the repository and delete the ZIP"
+        required: false
+        default: false
+        type: boolean
+      build_release:
+        description: "Also build the release APK (only runs when the signing secrets exist)"
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: filex-build
+  cancel-in-progress: false
+
+env:
+  MAX_FILES: "20000"
+  MAX_TOTAL_MB: "512"
+
+jobs:
+  build:
+    name: Extract ZIP and build APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Locate ZIP
+        id: locate
+        env:
+          INPUT_ZIP_PATH: ${{ inputs.zip_path }}
+        run: |
+          set -euo pipefail
+          found=""
+          found_abs=""
+          for candidate in "${INPUT_ZIP_PATH:-}" "FileXStudio-Source.zip" "input/FileXStudio.zip"; do
+            [ -z "$candidate" ] && continue
+            case "$candidate" in
+              /*|*..*) echo "::error::zip_path must be a relative path inside the repository (got '$candidate')"; exit 1 ;;
+            esac
+            abs="$(realpath -m "$GITHUB_WORKSPACE/$candidate")"
+            case "$abs" in
+              "$GITHUB_WORKSPACE"/*) ;;
+              *) echo "::error::zip_path resolves outside the repository"; exit 1 ;;
+            esac
+            if [ -f "$abs" ]; then
+              found="$candidate"
+              found_abs="$abs"
+              break
+            elif [ "$candidate" = "${INPUT_ZIP_PATH:-}" ]; then
+              echo "::error::ZIP not found at '$candidate'"
+              exit 1
+            fi
+          done
+          if [ -n "$found" ]; then
+            echo "ZIP: $found"
+            echo "Size: $(stat -c %s "$found_abs") bytes"
+            echo "SHA-256: $(sha256sum "$found_abs" | cut -d' ' -f1)"
+            {
+              echo "found=true"
+              echo "zip_rel=$found"
+              echo "zip_abs=$found_abs"
+            } >> "$GITHUB_OUTPUT"
+          elif [ -f settings.gradle.kts ] && [ -d app ]; then
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "No ZIP found. Building the project that is already in the repository."
+          else
+            echo "::error::No ZIP found. Upload FileXStudio-Source.zip to the repository root and run again."
+            exit 1
+          fi
+
+      - name: Validate ZIP
+        if: steps.locate.outputs.found == 'true'
+        env:
+          ZIP_PATH: ${{ steps.locate.outputs.zip_abs }}
+        run: |
+          python3 - <<'PY'
+          import os, stat, sys, zipfile
+
+          zip_path = os.environ["ZIP_PATH"]
+          max_files = int(os.environ["MAX_FILES"])
+          max_total = int(os.environ["MAX_TOTAL_MB"]) * 1024 * 1024
+
+
+          def fail(message):
+              print(f"::error::{message}")
+              sys.exit(1)
+
+
+          if not zipfile.is_zipfile(zip_path):
+              fail("The file is not a valid ZIP archive")
+
+          with zipfile.ZipFile(zip_path) as zf:
+              infos = zf.infolist()
+              if not infos:
+                  fail("The ZIP archive is empty")
+
+              files = 0
+              total = 0
+              for info in infos:
+                  name = info.filename.replace("\\", "/")
+                  if "\x00" in name:
+                      fail(f"Entry name contains a NUL byte: {info.filename!r}")
+                  if name.startswith("/") or (len(name) > 1 and name[1] == ":"):
+                      fail(f"Absolute path in ZIP (ZIP Slip protection): {info.filename}")
+                  if ".." in [p for p in name.split("/") if p not in ("", ".")]:
+                      fail(f"Path traversal entry rejected (ZIP Slip protection): {info.filename}")
+                  if stat.S_ISLNK(info.external_attr >> 16):
+                      fail(f"Symbolic links are not allowed in the ZIP: {info.filename}")
+                  if not info.is_dir():
+                      files += 1
+                      total += info.file_size
+
+              if files == 0:
+                  fail("The ZIP contains directories only, no files")
+              if files > max_files:
+                  fail(f"Too many files in ZIP: {files} (limit {max_files})")
+              if total > max_total:
+                  fail(f"Uncompressed size {total} bytes exceeds the limit of {max_total} bytes")
+
+              bad = zf.testzip()
+              if bad is not None:
+                  fail(f"Corrupted ZIP entry (CRC mismatch): {bad}")
+
+              print(f"ZIP is valid: {files} files, {total} bytes uncompressed")
+          PY
+
+      - name: Extract to staging area
+        if: steps.locate.outputs.found == 'true'
+        id: stage
+        env:
+          ZIP_PATH: ${{ steps.locate.outputs.zip_abs }}
+        run: |
+          python3 - <<'PY'
+          import os, pathlib, shutil, sys, zipfile
+
+          zip_path = os.environ["ZIP_PATH"]
+          stage = pathlib.Path(os.environ["RUNNER_TEMP"]) / "fx-stage"
+
+
+          def fail(message):
+              print(f"::error::{message}")
+              sys.exit(1)
+
+
+          if stage.exists():
+              shutil.rmtree(stage)
+          stage.mkdir(parents=True)
+          stage_real = stage.resolve()
+
+          IGNORED_NAMES = {".DS_Store", "Thumbs.db"}
+          count = 0
+          skipped_git = False
+          with zipfile.ZipFile(zip_path) as zf:
+              for info in zf.infolist():
+                  name = info.filename.replace("\\", "/")
+                  parts = [p for p in name.split("/") if p not in ("", ".")]
+                  if not parts:
+                      continue
+                  if parts[0] == "__MACOSX" or parts[-1] in IGNORED_NAMES:
+                      continue
+                  if ".git" in parts:
+                      skipped_git = True
+                      continue
+                  target = stage.joinpath(*parts)
+                  resolved = target.resolve()
+                  if resolved != stage_real and stage_real not in resolved.parents:
+                      fail(f"Entry escapes the extraction directory: {info.filename}")
+                  if info.is_dir():
+                      target.mkdir(parents=True, exist_ok=True)
+                      continue
+                  target.parent.mkdir(parents=True, exist_ok=True)
+                  with zf.open(info) as src, open(target, "wb") as dst:
+                      shutil.copyfileobj(src, dst)
+                  mode = (info.external_attr >> 16) & 0o777
+                  os.chmod(target, 0o755 if mode & 0o111 else 0o644)
+                  count += 1
+
+          if skipped_git:
+              print("::warning::Entries inside .git directories were ignored")
+          print(f"Extracted {count} files into the staging area")
+
+          # Detect and remove an unnecessary wrapper directory (e.g. FileXStudio/FileXStudio/app).
+          MARKERS = ("settings.gradle.kts", "settings.gradle", "gradlew", "build.gradle.kts", "build.gradle")
+
+
+          def has_markers(path):
+              return any((path / m).exists() for m in MARKERS)
+
+
+          root = stage
+          for _ in range(4):
+              if has_markers(root):
+                  break
+              entries = list(root.iterdir())
+              dirs = [e for e in entries if e.is_dir()]
+              if len(entries) == 1 and len(dirs) == 1:
+                  print(f"Unwrapping single top-level directory: {dirs[0].name}/")
+                  root = dirs[0]
+                  continue
+              break
+
+          if not ((root / "settings.gradle.kts").exists() or (root / "settings.gradle").exists()):
+              top = ", ".join(sorted(e.name for e in root.iterdir())) or "(empty)"
+              fail(
+                  "No Gradle settings file (settings.gradle.kts) found at the project root. "
+                  f"Top-level entries: {top}"
+              )
+          if not (root / "app").is_dir():
+              print("::warning::No app/ directory at the project root; is this the FileX Studio project?")
+
+          print(f"Project root inside ZIP: {root.relative_to(stage) or '.'}")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write(f"source_root={root}\n")
+          PY
+
+      - name: Copy project into the workspace
+        if: steps.locate.outputs.found == 'true'
+        env:
+          SOURCE_ROOT: ${{ steps.stage.outputs.source_root }}
+        run: |
+          python3 - <<'PY'
+          import filecmp, os, pathlib, shutil, sys
+
+          repo = pathlib.Path(os.environ["GITHUB_WORKSPACE"]).resolve()
+          src_root = pathlib.Path(os.environ["SOURCE_ROOT"])
+
+          # Never touched: git metadata, workflows (GITHUB_TOKEN cannot write them) and ZIP folders.
+          PROTECTED_PREFIXES = (".git/", ".github/", "input/")
+
+          new = updated = unchanged = 0
+          skipped = []
+          for path in sorted(src_root.rglob("*")):
+              if path.is_dir():
+                  continue
+              rel = path.relative_to(src_root).as_posix()
+              if rel.startswith(PROTECTED_PREFIXES):
+                  skipped.append(rel)
+                  continue
+              dest = (repo / rel).resolve()
+              if repo not in dest.parents:
+                  print(f"::error::Refusing to write outside the repository: {rel}")
+                  sys.exit(1)
+              try:
+                  dest.parent.mkdir(parents=True, exist_ok=True)
+                  if dest.exists():
+                      if filecmp.cmp(path, dest, shallow=False):
+                          unchanged += 1
+                          continue
+                      shutil.copy2(path, dest)
+                      updated += 1
+                  else:
+                      shutil.copy2(path, dest)
+                      new += 1
+              except OSError as exc:
+                  print(f"::error::Could not write {rel}: {exc}")
+                  sys.exit(1)
+
+          print(f"New: {new}  Updated: {updated}  Unchanged: {unchanged}  Ignored: {len(skipped)}")
+          for rel in skipped:
+              print(f"Ignored {rel}")
+          PY
+
+      - name: Save extracted source to the repository (optional)
+        if: steps.locate.outputs.found == 'true' && inputs.commit_source
+        env:
+          ZIP_REL: ${{ steps.locate.outputs.zip_rel }}
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm -q -f -- "$ZIP_REL"
+          [ -f gradlew ] && chmod +x gradlew
+          git add -A
+          [ -f gradlew ] && git update-index --chmod=+x gradlew
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+          git commit -q -m "chore: extract FileX Studio project from ZIP" -m "Source: $ZIP_REL"
+          git push origin "HEAD:refs/heads/$BRANCH"
+          echo "Source saved to $BRANCH and $ZIP_REL removed"
+
+      - name: Verify the project is present
+        run: |
+          if [ ! -f settings.gradle.kts ] || [ ! -d app ]; then
+            echo "::error::Android project not found after extraction."
+            exit 1
+          fi
+
+      - name: Read Gradle version from the wrapper properties
+        id: wrapper
+        run: |
+          set -euo pipefail
+          props=gradle/wrapper/gradle-wrapper.properties
+          if [ ! -f "$props" ]; then
+            echo "::error::$props is missing"
+            exit 1
+          fi
+          version="$(sed -n 's#.*gradle-\([0-9][0-9.]*\)-\(bin\|all\)\.zip.*#\1#p' "$props" | head -n1)"
+          if [ -z "$version" ]; then
+            echo "::error::Could not read the Gradle version from $props"
+            exit 1
+          fi
+          echo "Gradle version from wrapper properties: $version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if [ -f gradlew ] && [ -f gradle/wrapper/gradle-wrapper.jar ]; then
+            echo "needs_bootstrap=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "needs_bootstrap=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::gradlew / gradle-wrapper.jar are not in the repository; they will be generated for this run only."
+          fi
+
+      # AGP 8.7.x requires JDK 17.
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Prepare Android SDK
+        run: |
+          set -eo pipefail
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+          if [ -z "$SDK" ] || [ ! -x "$SDK/cmdline-tools/latest/bin/sdkmanager" ]; then
+            echo "::error::Android command-line tools were not found on this runner (ANDROID_HOME='$SDK')"
+            exit 1
+          fi
+          echo "Android SDK: $SDK"
+          # Accept all licences (yes exits with SIGPIPE once sdkmanager stops reading).
+          yes | "$SDK/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "$SDK/cmdline-tools/latest/bin/sdkmanager" "platforms;android-35" "build-tools;35.0.0"
+
+      # gradle-version is only set when the wrapper has to be generated.
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          gradle-version: ${{ steps.wrapper.outputs.needs_bootstrap == 'true' && steps.wrapper.outputs.version || '' }}
+
+      - name: Generate Gradle wrapper (only if missing)
+        if: steps.wrapper.outputs.needs_bootstrap == 'true'
+        env:
+          GRADLE_VERSION: ${{ steps.wrapper.outputs.version }}
+        run: |
+          set -euo pipefail
+          tmp="$(mktemp -d)"
+          (cd "$tmp" && gradle wrapper --gradle-version "$GRADLE_VERSION" --distribution-type bin)
+          mkdir -p gradle/wrapper
+          cp "$tmp/gradlew" "$tmp/gradlew.bat" .
+          cp "$tmp/gradle/wrapper/gradle-wrapper.jar" gradle/wrapper/gradle-wrapper.jar
+          chmod +x gradlew
+          echo "Generated wrapper for Gradle $GRADLE_VERSION (the project's gradle-wrapper.properties was not changed)"
+
+      - name: Validate Gradle wrapper
+        uses: gradle/actions/wrapper-validation@v6
+
+      - name: Prepare release signing (optional)
+        id: signing
+        env:
+          WANT_RELEASE: ${{ github.event_name != 'workflow_dispatch' || inputs.build_release }}
+          KS_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KS_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ "$WANT_RELEASE" != "true" ]; then
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "Release build not requested." | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if [ -z "$KS_BASE64" ] || [ -z "$KS_PASSWORD" ] || [ -z "$KEY_ALIAS" ] || [ -z "$KEY_PASSWORD" ]; then
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "Release APK skipped: signing secrets are not configured (ANDROID_KEYSTORE_BASE64, ANDROID_KEYSTORE_PASSWORD, ANDROID_KEY_ALIAS, ANDROID_KEY_PASSWORD). Only the debug APK is built." | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          keystore="$RUNNER_TEMP/release.keystore"
+          printf '%s' "$KS_BASE64" | base64 --decode > "$keystore"
+          {
+            echo "FILEX_KEYSTORE_PATH=$keystore"
+            echo "FILEX_KEYSTORE_PASSWORD=$KS_PASSWORD"
+            echo "FILEX_KEY_ALIAS=$KEY_ALIAS"
+            echo "FILEX_KEY_PASSWORD=$KEY_PASSWORD"
+          } >> "$GITHUB_ENV"
+          echo "enabled=true" >> "$GITHUB_OUTPUT"
+          echo "Release signing configured from repository secrets."
+
+      - name: Build debug APK
+        run: ./gradlew assembleDebug --stacktrace --console=plain
+
+      - name: Build release APK
+        if: steps.signing.outputs.enabled == 'true'
+        run: ./gradlew assembleRelease --stacktrace --console=plain
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v7
+        with:
+          name: FileXStudio-Debug-APK
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload release APK
+        if: steps.signing.outputs.enabled == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: FileXStudio-Release-APK
+          path: app/build/outputs/apk/release/*.apk
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload build reports (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: FileXStudio-Build-Reports
+          path: app/build/reports/
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Remove release keystore
+        if: always()
+        run: rm -f "$RUNNER_TEMP/release.keystore"
+        
