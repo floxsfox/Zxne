@@ -370,6 +370,8 @@ jobs:
         run: |
           set -euo pipefail
           tmp="$(mktemp -d)"
+          # Gradle refuses to run in a directory without a build; an empty settings file is enough.
+          touch "$tmp/settings.gradle"
           (cd "$tmp" && gradle wrapper --gradle-version "$GRADLE_VERSION" --distribution-type bin)
           mkdir -p gradle/wrapper
           cp "$tmp/gradlew" "$tmp/gradlew.bat" .
@@ -447,4 +449,3 @@ jobs:
       - name: Remove release keystore
         if: always()
         run: rm -f "$RUNNER_TEMP/release.keystore"
-        
